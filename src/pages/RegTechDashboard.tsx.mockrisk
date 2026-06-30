@@ -1,0 +1,583 @@
+import { useState, useEffect, useRef } from 'react'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import {
+  ShieldAlert, CheckCircle, AlertTriangle, AlertOctagon,
+  BarChart3, Users, TrendingUp, FileText, Bell,
+  RefreshCw, ExternalLink, Loader2, BookOpen,
+  Lightbulb, FilterX, Archive,
+} from 'lucide-react'
+import { fetchSpkSyncStatus, type SpkSyncStatus } from '@/services/spkSync'
+import { getRegTechSuggestions } from '@/services/silentAdvisor'
+
+type RiskLevel = 'low' | 'medium' | 'high' | 'critical'
+
+interface RiskRecord {
+  id: string
+  riskLevel: RiskLevel
+  customerNo: string
+  customerName: string
+  ruleName: string
+  description: string
+  recommendedAction: string
+  detectedAt: string
+  assignedTeam: string
+}
+
+const RISK_BADGE: Record<RiskLevel, string> = {
+  critical: 'bg-rose-100 text-rose-700 border-rose-200/60',
+  high: 'bg-amber-100 text-amber-700 border-amber-200/60',
+  medium: 'bg-blue-100 text-blue-700 border-blue-200/60',
+  low: 'bg-emerald-100 text-emerald-700 border-emerald-200/60',
+}
+
+const RISK_LABEL: Record<RiskLevel, string> = {
+  critical: 'Kritik',
+  high: 'Yüksek',
+  medium: 'Orta',
+  low: 'Düşük',
+}
+
+const mockRisks: RiskRecord[] = [
+  {
+    id: 'R-2024-001',
+    riskLevel: 'critical',
+    customerNo: '12345678901',
+    customerName: 'ABC Holding A.Ş.',
+    ruleName: 'SPK Seri:V No:98 — Yüksek Frekanslı İşlem',
+    description: 'Son 24 saatte 150+ adet alım-satım emri. Günlük ortalamanın 5 katı.',
+    recommendedAction: 'Müşteri temsilcisi ile görüş, işlem dokümantasyonu iste.',
+    detectedAt: '2024-06-17T09:30:00Z',
+    assignedTeam: 'Finansal Suistimal Takımı',
+  },
+  {
+    id: 'R-2024-002',
+    riskLevel: 'high',
+    customerNo: '98765432109',
+    customerName: 'XYZ Yatırım Ortaklığı',
+    ruleName: 'Limit Aşımı — Günlük İşlem Hacmi',
+    description: 'Günlük brüt hacim limiti 2.5M TL aşıldı. Gerçekleşen: 3.1M TL.',
+    recommendedAction: 'Risk komitesine bilgi ver, limit revizyonu değerlendir.',
+    detectedAt: '2024-06-17T08:15:00Z',
+    assignedTeam: 'Risk Yönetimi',
+  },
+  {
+    id: 'R-2024-003',
+    riskLevel: 'high',
+    customerNo: '11223344556',
+    customerName: 'Delta Portföy Yönetimi',
+    ruleName: 'Kara Para Aklama — Şüpheli Para Transferi',
+    description: 'İki offshore hesaba ardışık EFT. Her biri 499.999 TL. Structuring pattern.',
+    recommendedAction: 'MASAK bildirimi hazırla, hesap hareketlerini dondur.',
+    detectedAt: '2024-06-16T16:45:00Z',
+    assignedTeam: 'Uyum & Denetim',
+  },
+  {
+    id: 'R-2024-004',
+    riskLevel: 'medium',
+    customerNo: '55667788990',
+    customerName: 'Omega Gayrimenkul',
+    ruleName: 'İçeriden Bilgi Edinme — Öncü İşlem',
+    description: 'KAP açıklamasından önce %8 pozisyon artışı. Zamanlama anomalisi.',
+    recommendedAction: 'İnceleme başlat, telefon kayıtlarını talep et.',
+    detectedAt: '2024-06-16T11:20:00Z',
+    assignedTeam: 'Hukuk & İnceleme',
+  },
+  {
+    id: 'R-2024-005',
+    riskLevel: 'medium',
+    customerNo: '66778899001',
+    customerName: 'Sigma Varlık Yönetimi',
+    ruleName: 'Müşteri Tanıma — Eksik KYC Verisi',
+    description: 'Yüksek riskli ülke vatandaşı müşteri için PEP/SIP taraması güncel değil.',
+    recommendedAction: 'KYC yenileme talebi gönder, müşteri bilgi formu iste.',
+    detectedAt: '2024-06-15T14:10:00Z',
+    assignedTeam: 'Müşteri Uyum',
+  },
+  {
+    id: 'R-2024-006',
+    riskLevel: 'low',
+    customerNo: '99887766554',
+    customerName: 'Beta Teknoloji A.Ş.',
+    ruleName: 'Olağandışı İşlem — Tatil Günü Aktivitesi',
+    description: 'Resmi tatil günü 3 adet hisse alım emri verildi. Düşük öncelikli.',
+    recommendedAction: 'Rutin kontrol, rapor dosyasına ekle.',
+    detectedAt: '2024-06-14T10:00:00Z',
+    assignedTeam: 'Operasyon Monitöring',
+  },
+]
+
+const summary = {
+  spkScore: 94,
+  activeAlerts: 12,
+  riskyMovements: 45,
+  limitBreaches: 3,
+  suspiciousPatterns: 8,
+}
+
+export default function RegTechDashboard() {
+  const [filter, setFilter] = useState<RiskLevel | 'all'>('all')
+
+  const [spkData, setSpkData] = useState<SpkSyncStatus | null>(null)
+  const [spkLoading, setSpkLoading] = useState(false)
+  const [complianceFilter, setComplianceFilter] = useState(false)
+  const [highlightedSource, setHighlightedSource] = useState<string | null>(null)
+
+  const sourcesRef = useRef<HTMLDivElement>(null)
+  const updatesRef = useRef<HTMLDivElement>(null)
+
+  const handleCheckSpk = async () => {
+    setSpkLoading(true)
+    try {
+      const data = await fetchSpkSyncStatus()
+      setSpkData(data)
+    } finally {
+      setSpkLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    handleCheckSpk()
+  }, [])
+
+  useEffect(() => {
+    if (import.meta.env.DEV && spkData) {
+      // eslint-disable-next-line no-console
+      console.debug('[RegTech SPK Data]', spkData)
+    }
+  }, [spkData])
+
+  const scrollToRef = (ref: React.RefObject<HTMLDivElement | null>) => {
+    ref.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
+  const handleSourcesClick = () => {
+    scrollToRef(sourcesRef)
+    if (spkData && spkData.sources.length > 0) {
+      setHighlightedSource(spkData.sources[0].name)
+      setTimeout(() => setHighlightedSource(null), 2000)
+    }
+  }
+
+  const handleUpdatesClick = () => {
+    setComplianceFilter(false)
+    scrollToRef(updatesRef)
+  }
+
+  const handleComplianceClick = () => {
+    setComplianceFilter(true)
+    scrollToRef(updatesRef)
+  }
+
+  const filtered = filter === 'all'
+    ? mockRisks
+    : mockRisks.filter((r) => r.riskLevel === filter)
+
+  const counts = {
+    critical: mockRisks.filter((r) => r.riskLevel === 'critical').length,
+    high: mockRisks.filter((r) => r.riskLevel === 'high').length,
+    medium: mockRisks.filter((r) => r.riskLevel === 'medium').length,
+    low: mockRisks.filter((r) => r.riskLevel === 'low').length,
+  }
+
+  return (
+    <div className="min-h-screen bg-[#F8FAFC]">
+      <div className="max-w-[1440px] mx-auto px-6 py-8 space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold tracking-tight">RegTech Uyum & Risk</h2>
+          <p className="text-muted-foreground">
+            SPK, MASAK ve kurum içi uyum metriklerinin gerçek zamanlı takibi.
+          </p>
+        </div>
+        <Badge className="bg-blue-100 text-blue-700 border-blue-200/60">
+          <Bell size={14} className="mr-1" />
+          {summary.activeAlerts} Aktif Uyarı
+        </Badge>
+      </div>
+
+      {/* Summary Cards */}
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
+        <Card className="bg-white rounded-2xl border border-slate-200/70 shadow-sm border-l-4 border-l-emerald-500">
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="text-sm font-medium">SPK Uyum Skoru</CardTitle>
+            <ShieldAlert className="text-emerald-600" size={18} />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{summary.spkScore}<span className="text-sm font-normal text-muted-foreground">/100</span></div>
+          </CardContent>
+        </Card>
+        <Card className="bg-white rounded-2xl border border-slate-200/70 shadow-sm">
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="text-sm font-medium">Aktif Erken Uyarılar</CardTitle>
+            <Bell className="text-amber-600" size={18} />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{summary.activeAlerts}</div>
+          </CardContent>
+        </Card>
+        <Card className="bg-white rounded-2xl border border-slate-200/70 shadow-sm">
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="text-sm font-medium">Riskli Müşteri Hareketleri</CardTitle>
+            <Users className="text-blue-600" size={18} />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{summary.riskyMovements}</div>
+          </CardContent>
+        </Card>
+        <Card className="bg-white rounded-2xl border border-slate-200/70 shadow-sm">
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="text-sm font-medium">Limit Aşımı Uyarıları</CardTitle>
+            <TrendingUp className="text-rose-600" size={18} />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{summary.limitBreaches}</div>
+          </CardContent>
+        </Card>
+        <Card className="bg-white rounded-2xl border border-slate-200/70 shadow-sm">
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="text-sm font-medium">Şüpheli İşlem Paternleri</CardTitle>
+            <BarChart3 className="text-slate-600" size={18} />
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{summary.suspiciousPatterns}</div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Risk Level Breakdown */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {(['critical', 'high', 'medium', 'low'] as RiskLevel[]).map((level) => (
+          <button
+            key={level}
+            onClick={() => setFilter(filter === level ? 'all' : level)}
+            className={`rounded-2xl border border-slate-200/70 bg-white p-4 text-left shadow-sm transition-all ${
+              filter === level ? 'ring-2 ring-offset-1 ring-blue-500' : 'hover:shadow-md'
+            }`}
+          >
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-medium text-muted-foreground">{RISK_LABEL[level]}</span>
+              {level === 'critical' && <AlertOctagon size={16} className="text-rose-600" />}
+              {level === 'high' && <AlertTriangle size={16} className="text-amber-600" />}
+              {level === 'medium' && <AlertTriangle size={16} className="text-blue-600" />}
+              {level === 'low' && <CheckCircle size={16} className="text-emerald-600" />}
+            </div>
+            <div className="text-2xl font-bold">{counts[level]}</div>
+          </button>
+        ))}
+      </div>
+
+      {/* Risk Table */}
+      <Card className="bg-white rounded-2xl border border-slate-200/70 shadow-sm overflow-hidden">
+        <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardTitle className="text-base flex items-center gap-2">
+            <FileText size={18} className="text-slate-600" />
+            Risk Kayıtları
+          </CardTitle>
+          <Badge variant="outline">{filtered.length} kayıt</Badge>
+        </CardHeader>
+        <CardContent>
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow className="border-b border-slate-100 hover:bg-transparent bg-slate-50/60">
+                  <TableHead className="text-xs font-medium text-slate-500">Risk</TableHead>
+                  <TableHead className="text-xs font-medium text-slate-500">Müşteri No</TableHead>
+                  <TableHead className="text-xs font-medium text-slate-500">Müşteri Adı</TableHead>
+                  <TableHead className="text-xs font-medium text-slate-500">Kural</TableHead>
+                  <TableHead className="text-xs font-medium text-slate-500">Açıklama</TableHead>
+                  <TableHead className="text-xs font-medium text-slate-500">Önerilen Aksiyon</TableHead>
+                  <TableHead className="text-xs font-medium text-slate-500">Tespit</TableHead>
+                  <TableHead className="text-xs font-medium text-slate-500">Sorumlu Ekip</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {filtered.map((r) => (
+                  <TableRow key={r.id} className="border-b border-slate-50 hover:bg-slate-50/70">
+                    <TableCell>
+                      <Badge className={RISK_BADGE[r.riskLevel]}>{RISK_LABEL[r.riskLevel]}</Badge>
+                    </TableCell>
+                    <TableCell className="font-mono text-xs">{r.customerNo}</TableCell>
+                    <TableCell className="font-medium">{r.customerName}</TableCell>
+                    <TableCell className="max-w-[200px] truncate" title={r.ruleName}>{r.ruleName}</TableCell>
+                    <TableCell className="max-w-[250px] truncate" title={r.description}>{r.description}</TableCell>
+                    <TableCell className="max-w-[200px] truncate" title={r.recommendedAction}>{r.recommendedAction}</TableCell>
+                    <TableCell className="text-xs whitespace-nowrap">
+                      {new Date(r.detectedAt).toLocaleString('tr-TR')}
+                    </TableCell>
+                    <TableCell className="text-xs whitespace-nowrap">{r.assignedTeam}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+          {filtered.length === 0 && (
+            <p className="text-sm text-muted-foreground text-center py-8">Seçilen kriterlere uygun risk kaydı bulunamadı.</p>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* SPK Mevzuat Senkronizasyonu */}
+      <Card className="bg-white rounded-2xl border border-slate-200/70 shadow-sm overflow-hidden">
+        <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <div className="flex items-center gap-2">
+            <BookOpen size={20} className="text-blue-600" />
+            <CardTitle className="text-base">SPK Mevzuat Senkronizasyonu</CardTitle>
+          </div>
+          <Button onClick={handleCheckSpk} disabled={spkLoading} variant="outline" size="sm">
+            {spkLoading ? <Loader2 size={16} className="mr-2 animate-spin" /> : <RefreshCw size={16} className="mr-2" />}
+            SPK Kaynaklarını Kontrol Et
+          </Button>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          {spkData && (
+            <>
+              {/* Stats */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div className="rounded-2xl border border-slate-200/70 bg-white p-4 text-center shadow-sm">
+                  <p className="text-xs text-muted-foreground mb-1">Durum</p>
+                  <Badge className={spkData.status === 'active' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-700'}>
+                    {spkData.status === 'active' ? 'İzleme Aktif' : 'Pasif'}
+                  </Badge>
+                </div>
+                <button
+                  onClick={handleSourcesClick}
+                  className="rounded-2xl border border-slate-200/70 bg-white p-4 text-center cursor-pointer shadow-sm hover:shadow-md transition-all duration-200 active:scale-[0.99]"
+                >
+                  <p className="text-xs text-muted-foreground mb-1">İzlenen Kaynak</p>
+                  <p className="text-xl font-bold text-blue-600">{spkData.sources.length}</p>
+                </button>
+                <button
+                  onClick={handleUpdatesClick}
+                  className="rounded-2xl border border-slate-200/70 bg-white p-4 text-center cursor-pointer shadow-sm hover:shadow-md transition-all duration-200 active:scale-[0.99]"
+                >
+                  <p className="text-xs text-muted-foreground mb-1">Yeni Güncelleme</p>
+                  <p className="text-xl font-bold text-amber-600">{spkData.updates.length}</p>
+                </button>
+                <button
+                  onClick={handleComplianceClick}
+                  className="rounded-2xl border border-slate-200/70 bg-white p-4 text-center cursor-pointer shadow-sm hover:shadow-md transition-all duration-200 active:scale-[0.99]"
+                >
+                  <p className="text-xs text-muted-foreground mb-1">Uyum İncelemesi Gerekli</p>
+                  <p className="text-xl font-bold text-rose-600">
+                    {spkData.updates.filter((u) => u.requiresComplianceReview).length}
+                  </p>
+                </button>
+              </div>
+
+              {/* Sources */}
+              <div ref={sourcesRef}>
+                <p className="text-sm font-semibold text-slate-700 mb-3">İzlenen Kaynaklar</p>
+                <div className="grid gap-3 md:grid-cols-3">
+                  {spkData.sources.map((s) => (
+                    <div key={s.name} className={`rounded-2xl border border-slate-200/70 bg-white p-5 space-y-2 shadow-sm hover:shadow-md transition-all duration-300 ${highlightedSource === s.name ? 'ring-2 ring-blue-400' : ''}`}>
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium">{s.name}</span>
+                        <Badge className={`text-xs ${s.status === 'ok' ? 'bg-emerald-100 text-emerald-700 border-emerald-200/60' : 'bg-amber-100 text-amber-700 border-amber-200/60'}`}>
+                          {s.status === 'ok' ? 'Aktif' : 'Hata'}
+                        </Badge>
+                      </div>
+                      <p className="text-xs text-muted-foreground truncate" title={s.latestTitle}>{s.latestTitle}</p>
+                      <p className="text-[10px] text-muted-foreground">{s.latestDate}</p>
+                      <a
+                        href={s.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center text-xs text-blue-600 hover:underline"
+                      >
+                        <ExternalLink size={12} className="mr-1" />
+                        SPK sitesini aç
+                      </a>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Updates Table */}
+              {spkData.updates.length > 0 && (
+                <div ref={updatesRef}>
+                  <div className="flex items-center justify-between mb-3">
+                    <p className="text-sm font-semibold text-slate-700">Son Güncellemeler</p>
+                    {complianceFilter && (
+                      <div className="flex items-center gap-2">
+                        <Badge variant="outline" className="text-[10px] text-slate-500 border-slate-200/60">
+                          Sadece uyum incelemesi gereken kayıtlar gösteriliyor
+                        </Badge>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-2 text-[11px] text-slate-600 hover:text-slate-900"
+                          onClick={() => setComplianceFilter(false)}
+                        >
+                          <FilterX size={12} className="mr-1" />
+                          Filtreyi Temizle
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="overflow-x-auto">
+                    <Table>
+                      <TableHeader>
+                        <TableRow className="border-b border-slate-100 hover:bg-transparent bg-slate-50/60">
+                          <TableHead className="text-xs font-medium text-slate-500">Kaynak</TableHead>
+                          <TableHead className="text-xs font-medium text-slate-500">Başlık</TableHead>
+                          <TableHead className="text-xs font-medium text-slate-500">Etki</TableHead>
+                          <TableHead className="text-xs font-medium text-slate-500">Özet</TableHead>
+                          <TableHead className="text-xs font-medium text-slate-500">Tespit Zamanı</TableHead>
+                          <TableHead className="text-xs font-medium text-slate-500">Uyum İncelemesi</TableHead>
+                          <TableHead className="text-xs font-medium text-slate-500 text-right">İşlem</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {(complianceFilter
+                          ? spkData.updates.filter((u) => u.requiresComplianceReview)
+                          : spkData.updates
+                        ).map((u) => (
+                          <TableRow key={u.id} className="border-b border-slate-50 hover:bg-slate-50/70">
+                            <TableCell className="text-xs whitespace-nowrap">{u.source}</TableCell>
+                            <TableCell className="text-xs max-w-[200px] truncate" title={u.title}>{u.title}</TableCell>
+                            <TableCell>
+                              <Badge className={
+                                u.impact === 'high' || u.impact === 'critical'
+                                  ? 'bg-rose-100 text-rose-700 border-rose-200/60'
+                                  : u.impact === 'medium'
+                                    ? 'bg-amber-100 text-amber-700 border-amber-200/60'
+                                    : 'bg-emerald-100 text-emerald-700 border-emerald-200/60'
+                              }>
+                                {u.impact === 'high' ? 'Yüksek' : u.impact === 'medium' ? 'Orta' : u.impact === 'critical' ? 'Kritik' : 'Düşük'}
+                              </Badge>
+                            </TableCell>
+                            <TableCell className="text-xs max-w-[250px] truncate" title={u.summary}>{u.summary}</TableCell>
+                            <TableCell className="text-xs whitespace-nowrap">{new Date(u.detectedAt).toLocaleString('tr-TR')}</TableCell>
+                            <TableCell>
+                              {u.requiresComplianceReview ? (
+                                <Badge className="bg-rose-100 text-rose-700 border-rose-200/60">Gerekli</Badge>
+                              ) : (
+                                <Badge variant="outline" className="text-emerald-600 border-emerald-200/60">Gerekmez</Badge>
+                              )}
+                            </TableCell>
+                            <TableCell className="text-right">
+                              <a
+                                href={u.url || '#'}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 text-[11px] text-blue-600 hover:underline"
+                                onClick={(e) => { if (!u.url || u.url === '#') e.preventDefault() }}
+                              >
+                                <ExternalLink size={12} />
+                                Kaynağı Aç
+                              </a>
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+          {spkLoading && !spkData && (
+            <div className="flex items-center justify-center py-12 text-muted-foreground">
+              <Loader2 size={20} className="mr-2 animate-spin" />
+              SPK kaynakları kontrol ediliyor...
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* SPK Archive */}
+      {spkData && spkData.archive && spkData.archive.total > 0 && (
+        <Card className="bg-white rounded-2xl border border-slate-200/70 shadow-sm overflow-hidden">
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <div className="flex items-center gap-2">
+              <Archive size={20} className="text-slate-600" />
+              <CardTitle className="text-base">SPK Geçmiş Kayıt Arşivi</CardTitle>
+            </div>
+            <Badge variant="outline" className="text-[10px]">
+              {spkData.archive.total} kayıt
+            </Badge>
+          </CardHeader>
+          <CardContent>
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow className="border-b border-slate-100 hover:bg-transparent bg-slate-50/60">
+                    <TableHead className="text-xs font-medium text-slate-500">Kaynak</TableHead>
+                    <TableHead className="text-xs font-medium text-slate-500">Bülten No / Başlık</TableHead>
+                    <TableHead className="text-xs font-medium text-slate-500">Tarih</TableHead>
+                    <TableHead className="text-xs font-medium text-slate-500">Tür</TableHead>
+                    <TableHead className="text-xs font-medium text-slate-500 text-right">İşlem</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {spkData.archive.records.slice(0, 10).map((r) => (
+                    <TableRow key={r.id} className="border-b border-slate-50 hover:bg-slate-50/70">
+                      <TableCell className="text-xs whitespace-nowrap">SPK Bültenleri</TableCell>
+                      <TableCell className="text-xs max-w-[250px] truncate" title={r.title}>
+                        {r.number} — {r.title}
+                      </TableCell>
+                      <TableCell className="text-xs whitespace-nowrap">{r.isoDate}</TableCell>
+                      <TableCell className="text-xs whitespace-nowrap">
+                        <Badge variant="outline" className="text-[10px] text-slate-600 border-slate-200/60">Bülten</Badge>
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <a
+                          href={r.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-[11px] text-blue-600 hover:underline"
+                        >
+                          <ExternalLink size={12} />
+                          Kaynağı Aç
+                        </a>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Silent Advisor */}
+      <Card className="bg-white rounded-2xl border border-slate-200/70 shadow-sm border-l-4 border-l-indigo-500 overflow-hidden">
+        <CardHeader className="pb-2">
+          <div className="flex items-center gap-2">
+            <Lightbulb className="text-indigo-600" size={18} />
+            <CardTitle className="text-sm">Akıllı Öneri</CardTitle>
+            <Badge variant="outline" className="text-[10px] text-slate-500 border-slate-200/60">Silent Advisor</Badge>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {getRegTechSuggestions().slice(0, 2).map((s) => (
+            <div key={s.id} className="flex items-start gap-3 rounded-xl border border-slate-100 p-3 hover:shadow-sm transition-shadow">
+              <div className="mt-0.5 shrink-0">
+                {s.severity === 'critical' && <AlertTriangle size={14} className="text-rose-600" />}
+                {s.severity === 'warning' && <AlertTriangle size={14} className="text-amber-600" />}
+                {s.severity === 'info' && <CheckCircle size={14} className="text-blue-600" />}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 mb-0.5">
+                  <p className="text-xs font-semibold text-slate-800">{s.title}</p>
+                  <Badge className={
+                    s.severity === 'critical' ? 'bg-rose-100 text-rose-700 border-rose-200/60 text-[10px]' :
+                    s.severity === 'warning' ? 'bg-amber-100 text-amber-700 border-amber-200/60 text-[10px]' :
+                    'bg-blue-100 text-blue-700 border-blue-200/60 text-[10px]'
+                  }>
+                    {s.severity === 'critical' ? 'Kritik' : s.severity === 'warning' ? 'Uyarı' : 'Bilgi'}
+                  </Badge>
+                </div>
+                <p className="text-[11px] text-muted-foreground">{s.description}</p>
+              </div>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+      </div>
+    </div>
+  )
+}

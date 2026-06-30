@@ -1,0 +1,513 @@
+import express, { type Request, type Response } from 'express'
+import { readFileSync } from 'fs'
+import { join } from 'path'
+import { OpenAI } from 'openai'
+import multer from 'multer'
+
+// @ts-ignore
+import { fetchSpkBulletinArchiveRange } from '../server/services/spkBulletins.js'
+// @ts-ignore
+import { fetchSpkPressReleaseArchive } from '../server/services/spkPressReleases.js'
+// @ts-ignore
+import { fetchSpkLegislationArchive } from '../server/services/spkLegislation.js'
+// @ts-ignore
+import { fetchSpkPdfText, parsePdfBuffer } from '../server/services/spkPdfParser.js'
+
+const app = express()
+app.use(express.json())
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (_req: any, file: any, cb: any) => {
+    if (file.mimetype === 'application/pdf') cb(null, true)
+    else cb(new Error('Sadece PDF dosyaları kabul edilir.'), false)
+  },
+})
+
+// ── Load SPK archive cache ──────────────────────────────────────────────────
+let spkCache: any = null
+let lastRefreshedAt: string | null = null
+
+function loadCache() {
+  if (spkCache) return spkCache
+  const candidates = [
+    join(process.cwd(), 'server', '_cache', 'spk-archive.json'),
+    join(process.cwd(), 'api', '..', 'server', '_cache', 'spk-archive.json'),
+  ]
+  for (const p of candidates) {
+    try {
+      const raw = readFileSync(p, 'utf-8')
+      spkCache = JSON.parse(raw)
+      console.info(`[API] Loaded SPK cache: ${spkCache.records?.length} records`)
+      return spkCache
+    } catch {
+      // continue
+    }
+  }
+  console.warn('[API] No SPK cache found')
+  spkCache = { total: 0, source: 'none', records: [] }
+  return spkCache
+}
+
+// ── Merge helper ────────────────────────────────────────────────────────────
+function mergeRecords(existing: any[], fresh: any[]) {
+  const map = new Map<string, any>()
+  for (const r of existing) {
+    map.set(r.id, r)
+  }
+  let added = 0
+  for (const r of fresh) {
+    if (!map.has(r.id)) {
+      map.set(r.id, r)
+      added++
+    }
+  }
+  const merged = Array.from(map.values())
+  merged.sort((a: any, b: any) => {
+    const ta = a.isoDate ? new Date(a.isoDate).getTime() : 0
+    const tb = b.isoDate ? new Date(b.isoDate).getTime() : 0
+    return tb - ta
+  })
+  return { merged, added }
+}
+
+// ── Live refresh (stale-while-revalidate) ───────────────────────────────────
+async function refreshSpkCache() {
+  const currentYear = new Date().getFullYear()
+  const cached = loadCache()
+  let liveRecords: any[] = []
+  let fetchLog = [] as string[]
+
+  try {
+    console.info('[Refresh] Fetching bulletins 2025-' + currentYear)
+    const { records: bRecords } = await fetchSpkBulletinArchiveRange({
+      startYear: 2025,
+      endYear: currentYear,
+      limitPerYear: 200,
+    })
+    liveRecords.push(...bRecords)
+    fetchLog.push(`bulletins:${bRecords.length}`)
+  } catch (err: any) {
+    console.warn('[Refresh] Bulletins failed:', err.message || err)
+    fetchLog.push(`bulletins:error`)
+  }
+
+  try {
+    console.info('[Refresh] Fetching press releases 2025-' + currentYear)
+    const { records: pRecords } = await fetchSpkPressReleaseArchive({
+      startYear: 2025,
+      endYear: currentYear,
+      limitPerYear: 200,
+    })
+    liveRecords.push(...pRecords)
+    fetchLog.push(`press:${pRecords.length}`)
+  } catch (err: any) {
+    console.warn('[Refresh] Press failed:', err.message || err)
+    fetchLog.push(`press:error`)
+  }
+
+  try {
+    console.info('[Refresh] Fetching legislation')
+    const { records: lRecords } = await fetchSpkLegislationArchive({ limit: 100 })
+    liveRecords.push(...lRecords)
+    fetchLog.push(`legislation:${lRecords.length}`)
+  } catch (err: any) {
+    console.warn('[Refresh] Legislation failed:', err.message || err)
+    fetchLog.push(`legislation:error`)
+  }
+
+  const { merged, added } = mergeRecords(cached.records || [], liveRecords)
+  spkCache = {
+    ...cached,
+    records: merged,
+    total: merged.length,
+    source: added > 0 ? 'live' : (cached.source || 'cache'),
+    lastRefreshedAt: new Date().toISOString(),
+    refreshLog: fetchLog,
+    counts: {
+      bulletin: merged.filter((r: any) => r.sourceType === 'bulletin').length,
+      pressRelease: merged.filter((r: any) => r.sourceType === 'press-release').length,
+      legislation: merged.filter((r: any) => r.sourceType === 'legislation').length,
+      total: merged.length,
+    },
+  }
+  lastRefreshedAt = spkCache.lastRefreshedAt
+  console.info(`[Refresh] Total: ${merged.length}, Added: ${added}`)
+  return { merged, added, fetchLog }
+}
+
+// ── Health ──────────────────────────────────────────────────────────────────
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.json({ ok: true, env: process.env.VERCEL ? 'vercel' : 'local' })
+})
+
+// ── SPK Archive ─────────────────────────────────────────────────────────────
+app.get('/api/spk/archive', async (req: Request, res: Response) => {
+  const isRefresh = req.query.refresh === 'true'
+  const year = req.query.year as string | undefined
+  const sourceType = req.query.sourceType as string | undefined
+  const limit = Number(req.query.limit) || 100
+
+  let data = loadCache()
+  let added = 0
+  let fetchLog: string[] = []
+
+  if (isRefresh) {
+    try {
+      const result = await refreshSpkCache()
+      data = spkCache
+      added = result.added
+      fetchLog = result.fetchLog
+    } catch (err: any) {
+      console.warn('[Archive] Refresh failed:', err.message || err)
+      data = loadCache()
+      fetchLog = ['refresh-fatal-error']
+    }
+  }
+
+  let records = data.records || []
+  if (year !== undefined && year !== '' && year !== 'all') {
+    const y = Number(year)
+    records = records.filter((r: any) => r.year === y)
+  }
+  if (sourceType && sourceType !== 'all') {
+    records = records.filter((r: any) => r.sourceType === sourceType)
+  }
+
+  // Sort: newest first
+  records.sort((a: any, b: any) => {
+    const ta = a.isoDate ? new Date(a.isoDate).getTime() : 0
+    const tb = b.isoDate ? new Date(b.isoDate).getTime() : 0
+    return tb - ta
+  })
+
+  const sliced = records.slice(0, limit)
+  const counts = data.counts || {
+    bulletin: records.filter((r: any) => r.sourceType === 'bulletin').length,
+    pressRelease: records.filter((r: any) => r.sourceType === 'press-release').length,
+    legislation: records.filter((r: any) => r.sourceType === 'legislation').length,
+    total: records.length,
+  }
+
+  // Find latest bulletin number for UI
+  const bulletins = records.filter((r: any) => r.sourceType === 'bulletin')
+  const latestBulletin = bulletins.length > 0 ? bulletins[0] : null
+
+  res.json({
+    total: records.length,
+    source: isRefresh ? 'live' : (data.source || 'cache'),
+    records: sliced,
+    counts,
+    coverage: data.coverage,
+    stats: data.stats,
+    yearRange: data.yearRange,
+    lastRefreshedAt: data.lastRefreshedAt || lastRefreshedAt,
+    refreshLog: fetchLog,
+    added,
+    latestBulletin: latestBulletin ? {
+      number: latestBulletin.number,
+      title: latestBulletin.title,
+      isoDate: latestBulletin.isoDate,
+      url: latestBulletin.url,
+    } : null,
+  })
+})
+
+// ── SPK Sync Status ───────────────────────────────────────────────────────
+app.get('/api/spk/sync-status', async (_req: Request, res: Response) => {
+  const cached = loadCache()
+  const now = new Date().toISOString()
+  const today = now.split('T')[0]
+
+  // Find latest bulletin from cache (or try live if very stale)
+  const bulletins = (cached.records || []).filter((r: any) => r.sourceType === 'bulletin')
+  const latestBulletin = bulletins.length > 0 ? bulletins[0] : null
+  const latestPress = (cached.records || []).filter((r: any) => r.sourceType === 'press-release')[0]
+
+  res.json({
+    status: 'active',
+    lastCheckedAt: now,
+    sources: [
+      {
+        name: 'SPK Bültenleri',
+        type: 'bulletin',
+        url: 'https://spk.gov.tr/spk-bultenleri',
+        status: 'ok',
+        latestTitle: latestBulletin?.title || 'SPK Bülteni',
+        latestDate: latestBulletin?.isoDate || today,
+      },
+      {
+        name: 'SPK Mevzuat Sistemi',
+        type: 'regulation',
+        url: 'https://mevzuat.spk.gov.tr/',
+        status: 'ok',
+        latestTitle: 'Mevzuat Sistemi kontrol edildi',
+        latestDate: today,
+      },
+      {
+        name: 'SPK Basın Duyuruları',
+        type: 'announcement',
+        url: 'https://spk.gov.tr/duyurular/basin-duyurulari',
+        status: 'ok',
+        latestTitle: latestPress?.title || 'Basın duyuruları kontrol edildi',
+        latestDate: latestPress?.isoDate || today,
+      },
+    ],
+    updates: [],
+    archive: {
+      total: cached.total || 0,
+      source: cached.source || 'live',
+      records: (cached.records || []).slice(0, 20),
+      counts: cached.counts,
+      stats: cached.stats,
+      coverage: cached.coverage,
+      yearRange: cached.yearRange,
+      lastRefreshedAt: cached.lastRefreshedAt || lastRefreshedAt,
+      latestBulletin: latestBulletin ? {
+        number: latestBulletin.number,
+        title: latestBulletin.title,
+        isoDate: latestBulletin.isoDate,
+      } : null,
+    },
+  })
+})
+
+// ── OpenAI setup ────────────────────────────────────────────────────────────
+const openaiApiKey = process.env.OPENAI_API_KEY
+const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null
+const openaiModel = process.env.OPENAI_MODEL || 'gpt-4o-mini'
+
+function buildFallback(reason: string) {
+  return {
+    summary: `AI analizi yapılamadı. ${reason}`,
+    keyDecisions: [],
+    affectedAreas: ['Uyum'],
+    recommendedAction: 'Lütfen tekrar deneyin veya destek ekibine başvurun.',
+    impactLevel: 'low',
+    complianceChecklist: [],
+    possibleOperationalImpact: 'Bilinmiyor.',
+    sourceBasis: 'fallback',
+    reliability: 'low',
+    disclaimer: 'Bu analiz bilgilendirme amaçlıdır, uyum ekibi incelemesinin yerine geçmez.',
+  }
+}
+
+// ── SPK Analyze Bulletin ────────────────────────────────────────────────────
+app.post('/api/spk/analyze-bulletin', async (req: Request, res: Response) => {
+  const { record } = req.body || {}
+  if (!record) {
+    return res.status(400).json({ error: 'Missing record' })
+  }
+
+  // Try fetching PDF text
+  let pdfText: string | null = null
+  let sourceBasis: 'pdf_content' | 'metadata_only' | 'openai' = 'metadata_only'
+  try {
+    if (record.url && record.url.endsWith('.pdf')) {
+      pdfText = await fetchSpkPdfText(record.url)
+      if (pdfText && pdfText.length > 100) {
+        sourceBasis = 'pdf_content'
+        console.info(`[Analyze] PDF text loaded: ${pdfText.length} chars`)
+      }
+    }
+  } catch (err: any) {
+    console.warn('[Analyze] PDF fetch failed:', err.message || err)
+  }
+
+  const sourceText = pdfText || `${record.title || ''} ${record.number || ''}`
+
+  if (!openai) {
+    console.warn('[Analyze] OPENAI_API_KEY eksik')
+    return res.json(buildFallback('OPENAI_API_KEY environment variable eksik. Vercel Environment Variables ayarlarından ekleyin.'))
+  }
+
+  const userContent = pdfText && pdfText.length > 100
+    ? `Bülten: ${record.number || ''} — ${record.title || ''} — ${record.date || ''}\n\nPDF İçeriği (ilk bölüm):\n${pdfText.slice(0, 8000)}`
+    : `Bülten: ${record.number || ''} — ${record.title || ''} — ${record.date || ''} — ${record.url || ''}\n\nNot: PDF içeriği yüklenemedi, sadece metadata üzerinden analiz yap.`
+
+  try {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 30000)
+
+    const completion = await openai.chat.completions.create(
+      {
+        model: openaiModel,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'Sen SPK bültenlerini aracı kurum uyum, risk ve operasyon ekipleri açısından özetleyen kıdemli regülasyon analistisin.\n\nKURALLAR:\n1. Verilmeyen bilgiyi kesinlikle uydurma.\n2. Her kayıtta aynı genel cümleleri tekrarlama.\n3. Metinde açıkça geçen kararları, kurul kararlarını, ceza kararlarını, duyuruları veya düzenleme başlıklarını çıkar.\n4. En az 3 somut madde üretmeye çalış.\n5. affectedAreas sadece metinde açıkça ilişkili alanlardan seçilmeli; varsayılan olarak Uyum/Risk/Operasyon verme.\n6. Türkçe yanıt ver.\n7. Sadece JSON formatında yanıt ver, dışarıda metin olmasın.\n\nOlası affectedAreas: Uyum, Risk, Operasyon, MKK, Takasbank, MASAK, Müşteri Bildirimi, Emir İletimi, Açığa Satış, Halka Arz, Portföy Yönetimi, Yatırım Danışmanlığı, Araştırma, İç Kontrol, Bilgi Teknolojileri.',
+          },
+          {
+            role: 'user',
+            content: userContent,
+          },
+        ],
+        temperature: 0.15,
+        max_tokens: 700,
+        response_format: { type: 'json_object' },
+      },
+      { signal: controller.signal as any }
+    )
+    clearTimeout(timeout)
+
+    const raw = completion.choices[0]?.message?.content?.trim() || ''
+    let parsed: any = {}
+    try {
+      const match = raw.match(/\{[\s\S]*\}/)
+      parsed = match ? JSON.parse(match[0]) : {}
+    } catch {
+      parsed = {}
+    }
+
+    const result = {
+      summary: parsed.summary || 'Özet üretilemedi.',
+      keyDecisions: Array.isArray(parsed.keyDecisions) ? parsed.keyDecisions : [],
+      affectedAreas: Array.isArray(parsed.affectedAreas) ? parsed.affectedAreas : ['Uyum'],
+      recommendedAction: parsed.recommendedAction || 'İnceleme önerilir.',
+      impactLevel: ['low', 'medium', 'high'].includes(parsed.impactLevel) ? parsed.impactLevel : 'low',
+      complianceChecklist: Array.isArray(parsed.complianceChecklist) ? parsed.complianceChecklist : [],
+      possibleOperationalImpact: parsed.possibleOperationalImpact || 'Belirlenmedi.',
+      sourceBasis,
+      reliability: sourceBasis === 'pdf_content' ? 'high' : 'medium',
+      disclaimer: 'Bu analiz bilgilendirme amaçlıdır, uyum ekibi incelemesinin yerine geçmez.',
+    }
+
+    console.info('[Analyze] OpenAI success', record.number, 'source:', sourceBasis)
+    res.json(result)
+  } catch (err: any) {
+    console.warn('[Analyze] OpenAI error:', err.message || err)
+    res.json(buildFallback(`OpenAI çağrısı başarısız: ${err.message || 'Bilinmeyen hata'}`))
+  }
+})
+
+// ── SPK Analyze Bulletin PDF ────────────────────────────────────────────────
+app.post('/api/spk/analyze-bulletin-pdf', upload.single('pdf'), async (req: Request, res: Response) => {
+  try {
+    const record = req.body.record ? JSON.parse(req.body.record) : null
+    if (!record) {
+      return res.status(400).json({ error: 'Missing record' })
+    }
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({ error: 'PDF dosyası eksik' })
+    }
+
+    let pdfText = ''
+    try {
+      pdfText = await (parsePdfBuffer as any)(req.file.buffer)
+      console.info(`[Analyze PDF] Extracted ${pdfText.length} chars`)
+    } catch (err: any) {
+      console.warn('[Analyze PDF] Parse failed:', err.message || err)
+    }
+
+    const sourceText = pdfText || `${record.title || ''} ${record.number || ''}`
+
+    if (!openai) {
+      return res.json(buildFallback('OPENAI_API_KEY environment variable eksik.'))
+    }
+
+    if (!pdfText || pdfText.length < 50) {
+      return res.json(buildFallback("Yüklenen PDF'den yeterli metin çıkarılamadı"))
+    }
+
+    const userContent = `Bülten: ${record.number || ''} — ${record.title || ''} — ${record.date || ''}\n\nYüklenen PDF İçeriği:\n${pdfText.slice(0, 8000)}`
+
+    try {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 30000)
+
+      const completion = await openai.chat.completions.create(
+        {
+          model: openaiModel,
+          messages: [
+            {
+              role: 'system',
+              content:
+                'Sen SPK bültenlerini aracı kurum uyum, risk ve operasyon ekipleri açısından özetleyen kıdemli regülasyon analistisin.\n\nKURALLAR:\n1. Verilmeyen bilgiyi kesinlikle uydurma.\n2. PDF içinde açıkça geçen kararları, kurul kararlarını, ceza kararlarını, duyuruları veya düzenleme başlıklarını çıkar.\n3. En az 3 somut madde üretmeye çalış.\n4. Her bülten için aynı genel cümleleri tekrarlama.\n5. affectedAreas sadece metinde açıkça ilişkili alanlardan seçilmeli; varsayılan olarak Uyum/Risk/Operasyon verme.\n6. Türkçe yanıt ver.\n7. Sadece JSON formatında yanıt ver, dışarıda metin olmasın.\n\nOlası affectedAreas: Uyum, Risk, Operasyon, MKK, Takasbank, MASAK, Müşteri Bildirimi, Emir İletimi, Açığa Satış, Halka Arz, Portföy Yönetimi, Yatırım Danışmanlığı, Araştırma, İç Kontrol, Bilgi Teknolojileri.',
+            },
+            {
+              role: 'user',
+              content: userContent,
+            },
+          ],
+          temperature: 0.15,
+          max_tokens: 700,
+          response_format: { type: 'json_object' },
+        },
+        { signal: controller.signal as any }
+      )
+      clearTimeout(timeout)
+
+      const raw = completion.choices[0]?.message?.content?.trim() || ''
+      let parsed: any = {}
+      try {
+        const match = raw.match(/\{[\s\S]*\}/)
+        parsed = match ? JSON.parse(match[0]) : {}
+      } catch {
+        parsed = {}
+      }
+
+      const result = {
+        summary: parsed.summary || buildFallback('OpenAI yanıtı eksik').summary,
+        keyDecisions: Array.isArray(parsed.keyDecisions) && parsed.keyDecisions.length > 0 ? parsed.keyDecisions : buildFallback('OpenAI yanıtı eksik').keyDecisions,
+        affectedAreas: Array.isArray(parsed.affectedAreas) ? parsed.affectedAreas : ['Uyum'],
+        recommendedAction: parsed.recommendedAction || buildFallback('OpenAI yanıtı eksik').recommendedAction,
+        impactLevel: ['low', 'medium', 'high'].includes(parsed.impactLevel) ? parsed.impactLevel : 'low',
+        complianceChecklist: Array.isArray(parsed.complianceChecklist) && parsed.complianceChecklist.length > 0 ? parsed.complianceChecklist : buildFallback('OpenAI yanıtı eksik').complianceChecklist,
+        possibleOperationalImpact: parsed.possibleOperationalImpact || buildFallback('OpenAI yanıtı eksik').possibleOperationalImpact,
+        sourceBasis: 'uploaded_pdf',
+        reliability: 'high',
+        disclaimer: 'Bu analiz bilgilendirme amaçlıdır, uyum ekibi incelemesinin yerine geçmez.',
+      }
+
+      console.info('[Analyze PDF]', record.number, 'impact:', result.impactLevel)
+      res.json(result)
+    } catch (err: any) {
+      console.warn('[Analyze PDF] OpenAI error:', err.message || err)
+      res.json(buildFallback(`OpenAI çağrısı başarısız: ${err.message || 'Bilinmeyen hata'}`))
+    }
+  } catch (err: any) {
+    console.warn('[Analyze PDF] Error:', err.message || err)
+    res.status(500).json({ error: 'Analiz işlenirken hata oluştu.' })
+  }
+})
+
+// ── SPK Legislation Debug ───────────────────────────────────────────────────
+app.get('/api/spk/legislation/debug', (_req: Request, res: Response) => {
+  const cached = loadCache()
+  const legislation = (cached.records || []).filter((r: any) => r.sourceType === 'legislation')
+  res.json({
+    total: legislation.length,
+    records: legislation.slice(0, 10),
+  })
+})
+
+// ── Notifications ──────────────────────────────────────────────────────────
+app.get('/api/notifications', (_req: Request, res: Response) => {
+  res.json({ notifications: [], unreadCount: 0 })
+})
+
+app.get('/api/notifications/unread-count', (_req: Request, res: Response) => {
+  res.json({ unreadCount: 0 })
+})
+
+app.post('/api/notifications/:id/read', (_req: Request, res: Response) => {
+  res.json({ success: true })
+})
+
+app.post('/api/notifications/read-all', (_req: Request, res: Response) => {
+  res.json({ success: true, changed: 0 })
+})
+
+app.delete('/api/notifications/:id', (_req: Request, res: Response) => {
+  res.json({ success: true })
+})
+
+app.delete('/api/notifications/delete-all', (_req: Request, res: Response) => {
+  res.json({ success: true, deleted: 0 })
+})
+
+export default (req: any, res: any) => {
+  app(req, res)
+}
